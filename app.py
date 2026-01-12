@@ -12,7 +12,7 @@ import threading
 # 1. 페이지 설정
 st.set_page_config(page_title="Stable Device Translator", page_icon="🎤", layout="wide")
 st.title("🎤 Stable On-Device Translator")
-st.caption("스레드 안전성(Thread-Safe)이 강화된 버전입니다.")
+st.caption("CPU 모드 / 영어(English) 인식 고정")
 
 # 2. 스타일
 st.markdown("""
@@ -23,11 +23,13 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# 3. 모델 로드
+# 3. 모델 로드 (CPU 유지)
 @st.cache_resource
 def load_models():
+    # [유지] device="cpu" 그대로 사용
     whisper = WhisperModel("base", device="cpu", compute_type="int8")
-    llm = ChatOllama(model="gemma2:2b", temperature=0)
+    # 9b 모델 사용 (사용자 요청 반영)
+    llm = ChatOllama(model="gemma2:9b", temperature=0)
     return whisper, llm
 
 try:
@@ -52,11 +54,10 @@ if "audio_queue" not in st.session_state: st.session_state.audio_queue = queue.Q
 if "log_queue" not in st.session_state: st.session_state.log_queue = queue.Queue()
 if "ui_status" not in st.session_state: st.session_state.ui_status = "Stopped"
 
-# [핵심 변경] 스레드 제어용 이벤트 객체 (session_state 대신 사용)
 if "stop_event" not in st.session_state:
     st.session_state.stop_event = threading.Event()
 
-# --- 백그라운드 스레드 (session_state 제거됨) ---
+# --- 백그라운드 스레드 ---
 def record_thread(audio_queue, log_queue, energy_threshold, device_index, stop_event):
     r = sr.Recognizer()
     r.energy_threshold = energy_threshold
@@ -69,10 +70,8 @@ def record_thread(audio_queue, log_queue, energy_threshold, device_index, stop_e
         with sr.Microphone(device_index=device_index) as source:
             log_queue.put(">>> [Thread] 마이크 열림! 듣기 시작...")
             
-            # [수정] st.session_state 대신 stop_event.is_set() 체크
             while not stop_event.is_set():
                 try:
-                    # 5초 타임아웃
                     audio = r.listen(source, timeout=1, phrase_time_limit=15)
                     log_queue.put(">>> [Detected] 🎤 오디오 감지됨!")
                     audio_queue.put(audio)
@@ -118,14 +117,11 @@ with st.sidebar:
                 st.session_state.is_listening = True
                 st.session_state.ui_status = "Listening"
                 
-                # 큐 및 이벤트 초기화
                 with st.session_state.audio_queue.mutex: st.session_state.audio_queue.queue.clear()
                 with st.session_state.log_queue.mutex: st.session_state.log_queue.queue.clear()
                 
-                # 정지 신호 해제 (False로 설정)
                 st.session_state.stop_event.clear()
                 
-                # [수정] 스레드에 stop_event 전달
                 t = threading.Thread(
                     target=record_thread, 
                     args=(
@@ -133,7 +129,7 @@ with st.sidebar:
                         st.session_state.log_queue, 
                         energy_threshold, 
                         selected_index, 
-                        st.session_state.stop_event # 여기!
+                        st.session_state.stop_event
                     ), 
                     daemon=True
                 )
@@ -144,8 +140,6 @@ with st.sidebar:
         if st.button("⏹️ 중지", use_container_width=True):
             st.session_state.is_listening = False
             st.session_state.ui_status = "Stopped"
-            
-            # 정지 신호 발송 (True로 설정)
             st.session_state.stop_event.set()
             st.rerun()
 
@@ -172,7 +166,6 @@ for item in reversed(st.session_state.history):
 
 # 8. 메인 루프
 if st.session_state.is_listening:
-    # 로그 업데이트
     logs = []
     while not st.session_state.log_queue.empty():
         logs.append(st.session_state.log_queue.get())
@@ -182,7 +175,6 @@ if st.session_state.is_listening:
             for log in reversed(logs[-10:]):
                 st.text(log)
 
-    # 오디오 처리
     if not st.session_state.audio_queue.empty():
         st.session_state.ui_status = "Translating"
         status_placeholder.markdown('<div class="status-box translating">🟢 처리 중...</div>', unsafe_allow_html=True)
@@ -192,7 +184,8 @@ if st.session_state.is_listening:
             temp_file = f"temp_{time.time()}.wav"
             with open(temp_file, "wb") as f: f.write(audio_data.get_wav_data())
             
-            segments, _ = model_whisper.transcribe(temp_file, beam_size=5)
+            # [수정] language="en"을 추가하여 강제로 영어로만 인식하게 설정
+            segments, _ = model_whisper.transcribe(temp_file, beam_size=5, language="en")
             text_en = "".join([s.text for s in segments]).strip()
             
             if text_en:

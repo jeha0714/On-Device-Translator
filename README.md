@@ -1,4 +1,4 @@
-# 🎤 On-Device Real-time AI Translator (영-한 실시간 통역기)
+# 🎤 On-Device Real-time AI Translator
 
 이 프로젝트는 인터넷 연결 없이 로컬 환경(On-Device)에서 구동되는 **실시간 영어-한국어 음성 번역기**입니다.  
 OpenAI의 **Whisper** 모델로 음성을 인식하고, 구글의 경량 LLM인 **Gemma 2**를 사용하여 자연스러운 한국어로 번역합니다.
