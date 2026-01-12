@@ -42,7 +42,23 @@ except Exception as e:
 
 # 번역 체인
 prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are a professional interpreter. Translate the English input into natural Korean. Output ONLY the Korean translation."),
+    # 1. 역할 부여 (더 강력하게 경고)
+    ("system", """You are a professional interpreter. 
+    Your task is to translate the English input into natural Korean. 
+    Never answer the user's question or greet them back. 
+    Just output the translated Korean text."""),
+    
+    # 2. 예시 (Few-shot) - 모델에게 행동 패턴을 주입
+    ("user", "Hello"),
+    ("assistant", "안녕하세요"),
+    
+    ("user", "How are you?"),
+    ("assistant", "오늘 기분은 어떠신가요?"),
+    
+    ("user", "Nice to meet you"),
+    ("assistant", "만나서 반갑습니다"),
+    
+    # 3. 실제 입력
     ("user", "{text}")
 ])
 chain = prompt | llm | StrOutputParser()
@@ -166,6 +182,7 @@ for item in reversed(st.session_state.history):
 
 # 8. 메인 루프
 if st.session_state.is_listening:
+    # 로그 업데이트
     logs = []
     while not st.session_state.log_queue.empty():
         logs.append(st.session_state.log_queue.get())
@@ -175,21 +192,35 @@ if st.session_state.is_listening:
             for log in reversed(logs[-10:]):
                 st.text(log)
 
+    # 오디오 처리 부분
     if not st.session_state.audio_queue.empty():
+        # 1. 상태 변경: 처리 시작
         st.session_state.ui_status = "Translating"
-        status_placeholder.markdown('<div class="status-box translating">🟢 처리 중...</div>', unsafe_allow_html=True)
+        status_placeholder.markdown('<div class="status-box translating">👂 음성을 텍스트로 변환 중...</div>', unsafe_allow_html=True)
         
         try:
             audio_data = st.session_state.audio_queue.get()
             temp_file = f"temp_{time.time()}.wav"
             with open(temp_file, "wb") as f: f.write(audio_data.get_wav_data())
             
-            # [수정] language="en"을 추가하여 강제로 영어로만 인식하게 설정
+            # [Step 1] Whisper로 영어 인식
             segments, _ = model_whisper.transcribe(temp_file, beam_size=5, language="en")
             text_en = "".join([s.text for s in segments]).strip()
             
+            # [Step 2] 영어가 인식되었다면, 번역하기 전에 먼저 화면에 띄워줌! (핵심 기능)
             if text_en:
+                # 번역기(LLM)가 돌아가는 동안 사용자는 이 메시지를 보게 됩니다.
+                status_placeholder.markdown(f'''
+                    <div class="status-box translating">
+                        📝 <b>인식된 영어:</b> {text_en}<br>
+                        <span style="font-size:16px;">🔄 한국어로 번역하고 있습니다...</span>
+                    </div>
+                ''', unsafe_allow_html=True)
+                
+                # [Step 3] 이제 번역 시작
                 translation = chain.invoke({"text": text_en})
+                
+                # [Step 4] 히스토리 저장 및 최종 화면 갱신
                 st.session_state.history.append({"en": text_en, "ko": translation})
             
             if os.path.exists(temp_file): os.remove(temp_file)
@@ -197,6 +228,7 @@ if st.session_state.is_listening:
         except Exception as e:
             st.error(f"Error: {e}")
         
+        # 다시 듣기 모드로 복귀
         st.session_state.ui_status = "Listening"
         st.rerun()
     else:
