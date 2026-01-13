@@ -166,7 +166,7 @@ if st.session_state.is_listening:
             with open(temp_file, "wb") as f: f.write(audio_data.get_wav_data())
             
             # Whisper 변환
-            segments, _ = model_whisper.transcribe(temp_file, beam_size=1, temperature=0.0)
+            segments, _ = model_whisper.transcribe(temp_file, beam_size=2, temperature=0.0, language="en")
             text_en = "".join([s.text for s in segments]).strip()
             
             if text_en:
