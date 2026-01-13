@@ -1,275 +1,192 @@
 import streamlit as st
 import speech_recognition as sr
 from faster_whisper import WhisperModel
-import argostranslate.translate # [변경] 기계번역 라이브러리
+import argostranslate.translate
 import os
 import time
 import queue
 import threading
+import io
 
 # 1. 페이지 설정
-st.set_page_config(page_title="Offline Fast Translator", page_icon="⚡", layout="wide")
-st.title("⚡ Offline Fast Real-time Translator")
-st.caption("위: 기계번역 (Argos Translate) / 아래: 실시간 듣기")
+st.set_page_config(page_title="Custom Control Translator", page_icon="🎛️", layout="wide")
+st.title("🎛️ On-Device Real-time Translator")
 
-# 2. 스타일 정의
+# 2. 스타일 정의 (버튼 및 슬라이더 디자인)
 st.markdown("""
 <style>
-    .status-box { 
+    .main-container { display: flex; flex-direction: row; gap: 20px; }
+    .box { 
         padding: 20px; 
         border-radius: 10px; 
-        text-align: center; 
-        margin-bottom: 15px;
+        min-height: 300px;
+        font-size: 22px;
+        line-height: 1.6;
     }
-    .translating-box { 
-        background-color: #FFF3E0; 
-        color: #E65100; 
-        border: 2px solid #FB8C00; 
-        font-size: 22px; font-weight: bold;
-    }
-    .listening-box { 
-        background-color: #E3F2FD; 
-        color: #1565C0; 
-        border: 2px solid #1565C0; 
+    .en-box { background-color: #f8f9fa; border: 2px solid #dee2e6; color: #212529; }
+    .ko-box { background-color: #e3f2fd; border: 2px solid #90caf9; color: #0d47a1; }
+    .label { font-weight: bold; margin-bottom: 10px; font-size: 16px; color: #555; }
+    
+    /* 버튼 스타일링 */
+    div.stButton > button {
+        width: 100%;
+        height: 60px;
         font-size: 20px;
+        font-weight: bold;
     }
-    .text-content { font-size: 18px; color: #333; margin-top: 5px; font-weight: normal; }
-    .empty-state { color: #999; font-style: italic; }
 </style>
 """, unsafe_allow_html=True)
 
-# 3. 모델 로드 (Gemma 제거됨)
+# 3. 모델 로드 (속도 최적화: tiny.en)
 @st.cache_resource
 def load_models():
-    # Whisper: 음성 인식 (CPU 모드)
-    whisper = WhisperModel("base", device="cpu", compute_type="int8", cpu_threads=4)
+    whisper = WhisperModel("tiny.en", device="cpu", compute_type="int8", cpu_threads=8)
     return whisper
 
 try:
-    with st.spinner("Whisper 모델 로딩 중..."):
+    with st.spinner("AI 엔진 로딩 중..."):
         model_whisper = load_models()
-    st.success("✅ 모델 로딩 완료!")
 except Exception as e:
-    st.error(f"모델 로딩 실패: {e}")
+    st.error(f"오류: {e}")
     st.stop()
 
-# 4. 상태 변수 초기화
-if "history" not in st.session_state: st.session_state.history = []
+# 4. 상태 변수
 if "is_listening" not in st.session_state: st.session_state.is_listening = False
 if "audio_queue" not in st.session_state: st.session_state.audio_queue = queue.Queue()
-if "log_queue" not in st.session_state: st.session_state.log_queue = queue.Queue()
 if "stop_event" not in st.session_state: st.session_state.stop_event = threading.Event()
+if "live_en" not in st.session_state: st.session_state.live_en = ""
+if "live_ko" not in st.session_state: st.session_state.live_ko = ""
+if "history" not in st.session_state: st.session_state.history = []
 
-if "listening_text" not in st.session_state: st.session_state.listening_text = ""
-if "current_translating_text" not in st.session_state: st.session_state.current_translating_text = ""
-if "translation_queue" not in st.session_state: st.session_state.translation_queue = queue.Queue()
-
-# --- [변경] 번역 작업자 (Argos Translate 사용) ---
-def run_translation_job(text, result_queue):
-    try:
-        # [핵심] LLM 대신 기계번역 사용 (속도 매우 빠름)
-        # from_code="en", to_code="ko"
-        translation = argostranslate.translate.translate(text, "en", "ko")
-        result_queue.put({"en": text, "ko": translation})
-    except Exception as e:
-        print(f"Translation Error: {e}")
-        # 에러 발생 시 원문이라도 반환
-        result_queue.put({"en": text, "ko": "(번역 실패)"})
-
-# --- 녹음 스레드 (기존 동일) ---
-def record_thread(audio_queue, log_queue, energy_threshold, device_index, stop_event):
+# --- 녹음 스레드 ---
+def record_thread(audio_queue, stop_event, energy_threshold):
     r = sr.Recognizer()
-    r.energy_threshold = energy_threshold
-    r.dynamic_energy_threshold = False 
-    r.pause_threshold = 1.2
-    
-    import io
-    import time
-    
-    accumulated_audio_data = io.BytesIO()
-    silence_counter = 0
-    has_speech = False
-    speech_start_time = None
-    MAX_PHRASE_TIME = 15 
+    # [핵심] 사용자가 슬라이더로 설정한 민감도를 적용
+    r.energy_threshold = energy_threshold 
+    r.dynamic_energy_threshold = False # 수동 제어를 위해 자동 조절 끔
+    r.pause_threshold = 1.0
 
     try:
-        with sr.Microphone(device_index=device_index) as source:
-            log_queue.put(">>> [Thread] 마이크 열림!")
-            sample_rate = source.SAMPLE_RATE
-            sample_width = source.SAMPLE_WIDTH
-            
+        with sr.Microphone() as source:
+            accumulated_audio_data = io.BytesIO()
+            speech_start_time = None
+            has_speech = False
+            MAX_SENTENCE_TIME = 10 
+
             while not stop_event.is_set():
                 try:
-                    audio_chunk = r.listen(source, timeout=1, phrase_time_limit=1)
+                    audio_chunk = r.listen(source, timeout=1.0, phrase_time_limit=1.0)
                     accumulated_audio_data.write(audio_chunk.get_raw_data())
-                    
+
                     if not has_speech:
                         has_speech = True
                         speech_start_time = time.time()
                     
-                    silence_counter = 0 
-                    
-                    current_duration = time.time() - speech_start_time if speech_start_time else 0
-                    if current_duration > MAX_PHRASE_TIME:
-                        log_queue.put(f">>> [Force] 15초 초과!")
-                        full_audio = sr.AudioData(accumulated_audio_data.getvalue(), sample_rate, sample_width)
+                    full_audio = sr.AudioData(accumulated_audio_data.getvalue(), source.SAMPLE_RATE, source.SAMPLE_WIDTH)
+                    audio_queue.put((full_audio, False))
+
+                    if time.time() - speech_start_time > MAX_SENTENCE_TIME:
                         audio_queue.put((full_audio, True))
                         accumulated_audio_data = io.BytesIO()
                         has_speech = False
-                        silence_counter = 0
                         speech_start_time = None
-                        continue
-                    
-                    full_audio = sr.AudioData(accumulated_audio_data.getvalue(), sample_rate, sample_width)
-                    audio_queue.put((full_audio, False))
-                    
+                
                 except sr.WaitTimeoutError:
                     if has_speech:
-                        silence_counter += 1
-                        if silence_counter >= 2:
-                            log_queue.put(">>> [End] 문장 종료")
-                            full_audio = sr.AudioData(accumulated_audio_data.getvalue(), sample_rate, sample_width)
-                            audio_queue.put((full_audio, True))
-                            accumulated_audio_data = io.BytesIO()
-                            has_speech = False
-                            silence_counter = 0
-                            speech_start_time = None
+                        full_audio = sr.AudioData(accumulated_audio_data.getvalue(), source.SAMPLE_RATE, source.SAMPLE_WIDTH)
+                        audio_queue.put((full_audio, True))
+                        accumulated_audio_data = io.BytesIO()
+                        has_speech = False
+                        speech_start_time = None
                     continue
-                except Exception as e:
-                    log_queue.put(f">>> [Error] {e}")
+                except:
                     break
-    except Exception as e:
-        log_queue.put(f">>> [Fatal Error] {e}")
-
-# 5. 사이드바
-with st.sidebar:
-    st.header("🎛️ 설정")
-    try:
-        mics = sr.Microphone.list_microphone_names()
-        mic_options = [f"{i}: {name}" for i, name in enumerate(mics)]
-        default_idx = 0
-        for i, name in enumerate(mics):
-            if "Microphone" in name or "MacBook" in name:
-                default_idx = i
-                break
-        selected_mic = st.selectbox("마이크 선택", mic_options, index=default_idx)
-        selected_index = int(selected_mic.split(":")[0])
-    except:
-        selected_index = None
-    energy_threshold = st.slider("민감도", 50, 1000, 300)
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("▶️ 시작", use_container_width=True):
-            if not st.session_state.is_listening:
-                st.session_state.is_listening = True
-                with st.session_state.audio_queue.mutex: st.session_state.audio_queue.queue.clear()
-                st.session_state.stop_event.clear()
-                st.session_state.listening_text = "" 
-                st.session_state.current_translating_text = ""
-                
-                t = threading.Thread(target=record_thread, args=(st.session_state.audio_queue, st.session_state.log_queue, energy_threshold, selected_index, st.session_state.stop_event), daemon=True)
-                t.start()
-                st.rerun()
-    with col2:
-        if st.button("⏹️ 중지", use_container_width=True):
-            st.session_state.is_listening = False
-            st.session_state.stop_event.set()
-            st.rerun()
-    st.divider()
-    log_area = st.empty()
-
-# 6. 메인 화면 레이아웃
-translating_placeholder = st.empty()
-listening_placeholder = st.empty()
-
-if st.session_state.is_listening:
-    t_text = st.session_state.current_translating_text
-    if t_text:
-        translating_placeholder.markdown(f"""
-            <div class="status-box translating-box">
-                ⚡ <b>빠른 번역 중...</b><br>
-                <div class="text-content">"{t_text}"</div>
-            </div>
-        """, unsafe_allow_html=True)
-    else:
-        translating_placeholder.markdown("""
-            <div class="status-box" style="background-color:#f0f0f0; color:#aaa; border:2px dashed #ccc;">
-                ⏳ 변환 대기 중...
-            </div>
-        """, unsafe_allow_html=True)
-
-    l_text = st.session_state.listening_text
-    d_text = l_text if l_text else "<span class='empty-state'>...</span>"
-    listening_placeholder.markdown(f"""
-        <div class="status-box listening-box">
-            🔵 <b>듣고 있습니다 (Listening)</b><br>
-            <div class="text-content">"{d_text}"</div>
-        </div>
-    """, unsafe_allow_html=True)
-else:
-    st.info("왼쪽 사이드바에서 [시작] 버튼을 눌러주세요.")
-
-st.write("---")
-for item in reversed(st.session_state.history):
-    with st.container(border=True):
-        st.markdown(f"**🇺🇸 En:** {item['en']}")
-        st.markdown(f"**🇰🇷 Ko:** :blue[{item['ko']}]")
-
-# 8. 메인 루프 (Non-Blocking Logic)
-if st.session_state.is_listening:
-    
-    try:
-        while not st.session_state.translation_queue.empty():
-            result = st.session_state.translation_queue.get_nowait()
-            st.session_state.history.append(result)
-            if st.session_state.current_translating_text == result['en']:
-                 st.session_state.current_translating_text = ""
-            st.rerun()
     except:
         pass
 
-    logs = []
-    while not st.session_state.log_queue.empty(): logs.append(st.session_state.log_queue.get())
-    if logs:
-        with log_area.container():
-            for log in reversed(logs[-5:]): st.text(log)
+# ==========================================
+# 5. UI 구성 (컨트롤 패널)
+# ==========================================
 
+# [A] 민감도 조절 슬라이더 (상단 배치)
+# 300(조용한 방) ~ 4000(시끄러운 곳)
+sensitivity = st.slider("🎚️ 마이크 민감도 (낮을수록 작은 소리도 잡음)", min_value=100, max_value=2000, value=300, step=50, help="주변이 시끄러우면 값을 높이세요. 조용한 곳에서는 300 정도가 적당합니다.")
+
+# [B] 시작/중지 통합 버튼
+# 상태에 따라 버튼 텍스트와 기능을 분기함
+if st.session_state.is_listening:
+    # 현재 작동 중 -> '중지' 버튼 표시
+    if st.button("⏹️ 통역 중지 (Click to Stop)", type="primary"):
+        st.session_state.is_listening = False
+        st.session_state.stop_event.set()
+        st.rerun()
+else:
+    # 현재 정지됨 -> '시작' 버튼 표시
+    if st.button("▶️ 통역 시작 (Click to Start)"):
+        st.session_state.is_listening = True
+        st.session_state.history = []
+        st.session_state.live_en = ""
+        st.session_state.live_ko = ""
+        st.session_state.stop_event.clear()
+        with st.session_state.audio_queue.mutex: st.session_state.audio_queue.queue.clear()
+        
+        # 슬라이더 값을 스레드로 전달
+        t = threading.Thread(
+            target=record_thread, 
+            args=(st.session_state.audio_queue, st.session_state.stop_event, sensitivity), 
+            daemon=True
+        )
+        t.start()
+        st.rerun()
+
+st.divider()
+
+# [C] 메인 화면 (좌우 분할)
+col1, col2 = st.columns(2)
+
+with col1:
+    st.markdown("<div class='label'>🇺🇸 ENGLISH</div>", unsafe_allow_html=True)
+    # 히스토리 + 라이브 텍스트 결합
+    full_text_en = "".join([h[0] + " " for h in st.session_state.history]) + f"**{st.session_state.live_en}**"
+    st.markdown(f"<div class='box en-box'>{full_text_en}</div>", unsafe_allow_html=True)
+
+with col2:
+    st.markdown("<div class='label'>🇰🇷 KOREAN</div>", unsafe_allow_html=True)
+    full_text_ko = "".join([h[1] + " " for h in st.session_state.history]) + f"**{st.session_state.live_ko}**"
+    st.markdown(f"<div class='box ko-box'>{full_text_ko}</div>", unsafe_allow_html=True)
+
+# 6. 메인 로직 (파일 저장 방식 + 고속 설정)
+if st.session_state.is_listening:
     if not st.session_state.audio_queue.empty():
         try:
             audio_data, is_final = st.session_state.audio_queue.get()
             
-            temp_file = f"temp_{time.time()}.wav"
+            # 안전한 파일 저장 방식
+            temp_file = "temp_control.wav"
             with open(temp_file, "wb") as f: f.write(audio_data.get_wav_data())
             
-            segments, _ = model_whisper.transcribe(temp_file, beam_size=5, language="en")
+            # Whisper 변환
+            segments, _ = model_whisper.transcribe(temp_file, beam_size=1, temperature=0.0)
             text_en = "".join([s.text for s in segments]).strip()
             
-            if os.path.exists(temp_file): os.remove(temp_file)
-
             if text_en:
+                try:
+                    text_ko = argostranslate.translate.translate(text_en, "en", "ko")
+                except:
+                    text_ko = "..."
+
+                st.session_state.live_en = text_en
+                st.session_state.live_ko = text_ko
+                
                 if is_final:
-                    st.session_state.listening_text = ""
-                    st.session_state.current_translating_text = text_en
-                    
-                    # [변경] 스레드에서 Argos 번역 함수 실행
-                    t = threading.Thread(
-                        target=run_translation_job, 
-                        args=(text_en, st.session_state.translation_queue),
-                        daemon=True
-                    )
-                    t.start()
-                    
-                else:
-                    st.session_state.listening_text = text_en
+                    st.session_state.history.append((text_en, text_ko))
+                    st.session_state.live_en = ""
+                    st.session_state.live_ko = ""
             
             st.rerun()
-            
+
         except Exception as e:
-            st.error(f"Error: {e}")
-            time.sleep(0.1)
             st.rerun()
     else:
         time.sleep(0.05)
-        if st.session_state.is_listening:
-            st.rerun()
+        st.rerun()
